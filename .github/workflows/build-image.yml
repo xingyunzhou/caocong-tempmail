@@ -1,0 +1,86 @@
+name: Build and push image
+
+# 自动构建镜像并推到 GitHub 自带的镜像仓库 ghcr.io（GitHub Container Registry）。
+# 你不需要注册 Docker Hub，也不需要自己配密码 —— 用仓库自带的 GITHUB_TOKEN 就够了。
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write # 允许把镜像推到 ghcr.io
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # ghcr.io 的镜像名只接受小写，而 GitHub 用户名可能有大写字母。
+      # 这一步把仓库所有者名字转成小写，后面统一用 steps.repo.outputs.owner_lc。
+      - id: repo
+        name: Normalize owner name to lowercase
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "owner_lc=${OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        name: Compute image tags
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.repo.outputs.owner_lc }}/caocong-tempmail
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=raw,value=smoke-{{sha}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 冒烟测试：镜像真的能启动后端模块才算构建成功。
+      # 和官方 deploy.yml 用同一组模块，任何 import 报错都会让这次构建红掉。
+      - id: smoke
+        name: Smoke test the pushed image
+        run: |
+          image="ghcr.io/${{ steps.repo.outputs.owner_lc }}/caocong-tempmail:smoke-${GITHUB_SHA}"
+          docker run --rm --entrypoint node "$image" --input-type=module -e \
+            "await import('./server/relay/poller.mjs'); await import('./server/relay/cleanup.mjs'); await import('./server/member/mutations.mjs');"
+          echo "image_ref=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "服务器上把它写进 \`installer/.env\` 的 \`NODEMAIL_IMAGE\` 即可。"
+          } >> "$GITHUB_STEP_SUMMARY"
